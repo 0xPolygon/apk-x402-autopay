@@ -108,15 +108,29 @@ elements.unlockForm.addEventListener("submit", async (event) => {
 
 async function submitDecision(approve: boolean) {
   if (!challengeId) return;
-  await chrome.runtime.sendMessage({
+  const response = (await chrome.runtime.sendMessage({
     type: "x402:promptDecision",
     challengeId,
     decision: {
       approve,
       alwaysAllow: elements.policyToggle.checked && approve,
     },
-  });
-  window.close();
+  })) as { status?: string; message?: string } | undefined;
+
+  const status = response?.status ?? "success";
+  if (status === "success" || status === "denied") {
+    window.close();
+    return;
+  }
+
+  if (status === "locked") {
+    elements.status.textContent = response?.message ?? "Wallet is locked. Unlock to continue.";
+    await loadChallenge();
+    return;
+  }
+
+  elements.status.textContent = response?.message ?? "Unable to process payment.";
+  await loadChallenge();
 }
 
 function safeBigInt(value: string | number | null | undefined): bigint {

@@ -35,6 +35,13 @@ import { parseChallengeHeaders } from "./shared/x402";
 import { getTokenPriceUsd } from "./shared/api";
 import { encryptSecret, decryptSecret } from "./shared/crypto";
 
+class WalletLockedError extends Error {
+  constructor(message = "Wallet locked") {
+    super(message);
+    this.name = "WalletLockedError";
+  }
+}
+
 const BALANCE_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
 const BALANCE_REFRESH_ALARM = "x402-balance-refresh";
 const JWT_TTL_MS = 5 * 60 * 1000;
@@ -44,6 +51,11 @@ const PROMPT_HEIGHT = 560;
 const RPC_URLS: Record<ChainId, string> = {
   polygonAmoy: "https://rpc-amoy.polygon.technology",
   polygon: "https://polygon-rpc.com",
+};
+
+const CHAIN_ID_BY_SETTING: Record<ChainId, number> = {
+  polygon: 137,
+  polygonAmoy: 80002,
 };
 
 const PENDING_CHALLENGE_TTL_MS = 10 * 60 * 1000;
@@ -83,6 +95,71 @@ type WalletUpdatePayload = {
   lockDurationMinutes?: number;
   label?: string;
 };
+
+function canonicalNetworkForChain(chainId: number | undefined): string | undefined {
+  if (!Number.isFinite(chainId)) return undefined;
+  if (chainId === 137) return "polygon";
+  if (chainId === 80002) return "polygon-amoy";
+  return undefined;
+}
+
+function normalizeNetworkDescriptor(challenge: ChallengeDetails, settings: ExtensionSettings): {
+  descriptor: string;
+  version: 1 | 2;
+} {
+  const raw = challenge.rawChallenge as Record<string, unknown> | undefined;
+  const accepts = Array.isArray((raw as { accepts?: unknown[] } | undefined)?.accepts)
+    ? ((raw as { accepts?: unknown[] })?.accepts ?? [])
+    : [];
+  const firstAccept = accepts.find(
+    (entry) => entry && typeof entry === "object" && (entry as { scheme?: unknown }).scheme === "exact",
+  ) as Record<string, unknown> | undefined;
+
+  const fromChallengeField =
+    typeof challenge.network === "string" && challenge.network.trim() !== ""
+      ? challenge.network.trim()
+      : undefined;
+  const fromAccepts =
+    typeof firstAccept?.network === "string" && firstAccept.network.trim() !== ""
+      ? (firstAccept.network as string).trim()
+      : undefined;
+  const fromRaw =
+    typeof raw?.network === "string" && (raw.network as string).trim() !== ""
+      ? (raw.network as string).trim()
+      : undefined;
+
+  const descriptor =
+    fromChallengeField ??
+    fromAccepts ??
+    fromRaw ??
+    (typeof challenge.chainId === "number" && Number.isFinite(challenge.chainId) && challenge.chainId > 0
+      ? `eip155:${challenge.chainId}`
+      : canonicalNetworkForChain(CHAIN_ID_BY_SETTING[settings.chain])) ??
+    `eip155:${challenge.chainId ?? CHAIN_ID_BY_SETTING[settings.chain] ?? 0}`;
+
+  const hintedVersionRaw =
+    challenge.x402Version ??
+    (typeof raw?.x402Version === "number" ? (raw.x402Version as number) : undefined) ??
+    (typeof firstAccept?.x402Version === "number" ? (firstAccept.x402Version as number) : undefined) ??
+    (typeof raw?.version === "number" ? (raw.version as number) : undefined);
+
+  const hintedVersion = hintedVersionRaw === 2 ? 2 : hintedVersionRaw === 1 ? 1 : undefined;
+  const derivedVersion = descriptor.includes(":") ? 2 : 1;
+  const version = hintedVersion ?? derivedVersion;
+
+  console.info("x402-autopay:bg normalizeNetworkDescriptor", {
+    challengeId: challenge.challengeId,
+    descriptor,
+    hintedVersion,
+    derivedVersion,
+    finalVersion: version === 2 ? 2 : 1,
+    fromChallengeField,
+    fromAccepts,
+    fromRaw,
+  });
+
+  return { descriptor, version: version === 2 ? 2 : 1 };
+}
 
 function normalizeLockDuration(minutes?: number): number {
   if (typeof minutes !== "number" || !Number.isFinite(minutes)) {
@@ -429,7 +506,18 @@ async function handleChallenge(
   await ensureChallengeStored(challenge, sender.tab?.id);
 
   if (shouldAutoApprove(state, challenge)) {
-    return withExtensionStatus("paying", () => processPayment(challenge, true));
+    try {
+      return await withExtensionStatus("paying", () => processPayment(challenge, true));
+    } catch (error) {
+      if (error instanceof WalletLockedError) {
+        console.info("x402-autopay:bg auto-approve blocked by locked wallet", {
+          challengeId: challenge.challengeId,
+        });
+        // fall through to prompt flow
+      } else {
+        throw error;
+      }
+    }
   }
 
   const promptUrl = `${chrome.runtime.getURL("prompt.html")}#${challenge.challengeId}`;
@@ -511,17 +599,10 @@ async function createAuthorization(
     signature,
   };
 
-  const networkDescriptor =
-    typeof challenge.chainId === "number" && Number.isFinite(challenge.chainId) && challenge.chainId > 0
-      ? `eip155:${challenge.chainId}`
-      : settings.chain === "polygon"
-        ? "eip155:137"
-        : settings.chain === "polygonAmoy"
-          ? "eip155:80002"
-          : `eip155:${challenge.chainId ?? 0}`;
+  const { descriptor: networkDescriptor, version: x402Version } = normalizeNetworkDescriptor(challenge, settings);
 
   const xPaymentHeaderObj = {
-    x402Version: 1,
+    x402Version,
     scheme: "exact",
     network: networkDescriptor,
     payload,
@@ -574,7 +655,7 @@ async function processPayment(
         lockedUntil: 0,
       },
     });
-    return { action: "error", message: "Wallet locked" };
+    throw new WalletLockedError();
   }
   try {
     const { paymentId, xPaymentHeader } = await createAuthorization(wallet, state.settings, challenge);
@@ -632,66 +713,87 @@ async function processPayment(
   }
 }
 
-async function handlePromptDecision(challengeId: string, decision: PromptDecision) {
+type PromptDecisionResult = {
+  status: "success" | "denied" | "locked" | "error";
+  message?: string;
+};
+
+async function handlePromptDecision(challengeId: string, decision: PromptDecision): Promise<PromptDecisionResult> {
   console.info("x402-autopay:bg promptDecision", {
     challengeId,
     decision,
   });
   const pending = await getPendingChallenges();
   const entry = pending[challengeId];
-  if (!entry) return;
+  if (!entry) {
+    return { status: "error", message: "Challenge not found" };
+  }
   const { challenge, tabId, windowId } = entry;
 
   if (decision.approve) {
-    const resolution = await withExtensionStatus("paying", () => processPayment(challenge, false));
-    if (tabId != null) {
-      chrome.tabs
-        .sendMessage(tabId, {
-          type: "x402:resolution",
-          challengeId,
-          resolution,
-        })
-        .catch(() => undefined);
-    }
-    if (decision.alwaysAllow) {
-      const updatedState = await getState();
-      const policy = updatedState.policies[challenge.origin] ?? createDefaultPolicy(challenge.origin);
-      policy.allowUnderThreshold = true;
-      await setState({
-        policies: {
-          ...updatedState.policies,
-          [challenge.origin]: policy,
-        },
-      });
-    }
-  } else {
-    const record: PaymentRecord = {
-      id: challengeId,
-      origin: challenge.origin,
-      endpoint: challenge.endpoint,
-      amountUsd: challenge.amountUsd,
-      tokenSymbol: challenge.tokenSymbol,
-      timestamp: Date.now(),
-      status: "denied",
-      autoApproved: false,
-    };
-    await recordPayment(record);
-    await setExtensionStatus("idle");
-    await clearChallenge(challengeId);
-    if (tabId != null) {
-      chrome.tabs
-        .sendMessage(tabId, {
-          type: "x402:resolution",
-          challengeId,
-          resolution: { action: "deny" },
-        })
-        .catch(() => undefined);
+    try {
+      const resolution = await withExtensionStatus("paying", () => processPayment(challenge, false));
+      if (tabId != null) {
+        chrome.tabs
+          .sendMessage(tabId, {
+            type: "x402:resolution",
+            challengeId,
+            resolution,
+          })
+          .catch(() => undefined);
+      }
+      if (decision.alwaysAllow) {
+        const updatedState = await getState();
+        const policy = updatedState.policies[challenge.origin] ?? createDefaultPolicy(challenge.origin);
+        policy.allowUnderThreshold = true;
+        await setState({
+          policies: {
+            ...updatedState.policies,
+            [challenge.origin]: policy,
+          },
+        });
+      }
+      await clearChallenge(challengeId);
+      if (windowId != null) {
+        chrome.windows.remove(windowId).catch(() => undefined);
+      }
+      return { status: "success" };
+    } catch (error) {
+      if (error instanceof WalletLockedError) {
+        console.info("x402-autopay:bg promptDecision locked", { challengeId });
+        return { status: "locked", message: "Wallet locked" };
+      }
+      console.error("x402-autopay:bg promptDecision error", { challengeId, error });
+      return { status: "error", message: error instanceof Error ? error.message : String(error) };
     }
   }
 
+  const record: PaymentRecord = {
+    id: challengeId,
+    origin: challenge.origin,
+    endpoint: challenge.endpoint,
+    amountUsd: challenge.amountUsd,
+    tokenSymbol: challenge.tokenSymbol,
+    timestamp: Date.now(),
+    status: "denied",
+    autoApproved: false,
+  };
+  await recordPayment(record);
+  await setExtensionStatus("idle");
+  await clearChallenge(challengeId);
+  if (tabId != null) {
+    chrome.tabs
+      .sendMessage(tabId, {
+        type: "x402:resolution",
+        challengeId,
+        resolution: { action: "deny" },
+      })
+      .catch(() => undefined);
+  }
   if (windowId != null) {
     chrome.windows.remove(windowId).catch(() => undefined);
   }
+  return { status: "denied" };
 }
 
 async function handleSettlementNotice(notice: SettlementNotice) {
@@ -724,10 +826,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "x402:promptDecision") {
-    handlePromptDecision(message.challengeId, message.decision as PromptDecision).catch(
-      (error: unknown) => console.error("prompt decision failed", error),
-    );
-    sendResponse({ ok: true });
+    handlePromptDecision(message.challengeId, message.decision as PromptDecision)
+      .then(sendResponse)
+      .catch((error: unknown) => {
+        console.error("prompt decision failed", error);
+        sendResponse({ status: "error", message: String(error) });
+      });
     return true;
   }
 

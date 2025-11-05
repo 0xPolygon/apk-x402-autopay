@@ -94,12 +94,14 @@ export interface ChallengeDetails {
   rawHeaders: Record<string, string>;
   method: string;
   chainId: number;
+  network?: string;
   tokenAddress: `0x${string}`;
   seller: `0x${string}`;
   amountAtomic: string;
   tokenName?: string;
   tokenVersion?: string;
   tokenDecimals?: number;
+  x402Version?: number;
   rawChallenge?: unknown;
 }
 
