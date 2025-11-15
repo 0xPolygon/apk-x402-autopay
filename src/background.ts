@@ -609,11 +609,12 @@ async function createAuthorization(
   };
 
   const headerJson = JSON.stringify(xPaymentHeaderObj);
-  const headerEncoded = encodeBase64(headerJson);
+  // Always encode per spec to avoid servers treating the header as missing and re-issuing 402 responses.
+  const headerValue = encodeBase64(headerJson);
 
   return {
     paymentId: challenge.challengeId,
-    xPaymentHeader: headerEncoded,
+    xPaymentHeader: headerValue,
   };
 }
 
