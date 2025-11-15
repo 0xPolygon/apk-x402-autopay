@@ -553,7 +553,7 @@ async function createAuthorization(
   wallet: WalletData,
   settings: ExtensionSettings,
   challenge: ChallengeDetails,
-): Promise<{ paymentId: string; xPaymentHeader: string; extraHeaders?: Record<string, string> }> {
+): Promise<{ paymentId: string; xPaymentHeader: string }> {
   const provider = new ethers.JsonRpcProvider(RPC_URLS[settings.chain]);
   const privateKey = wallet.privateKey?.trim();
   if (!privateKey) {
@@ -612,12 +612,9 @@ async function createAuthorization(
   // Always encode per spec to avoid servers treating the header as missing and re-issuing 402 responses.
   const headerValue = encodeBase64(headerJson);
 
-  const extraHeaders: Record<string, string> = {};
-
   return {
     paymentId: challenge.challengeId,
     xPaymentHeader: headerValue,
-    extraHeaders: Object.keys(extraHeaders).length ? extraHeaders : undefined,
   };
 }
 
@@ -662,7 +659,7 @@ async function processPayment(
     throw new WalletLockedError();
   }
   try {
-    const { paymentId, xPaymentHeader, extraHeaders } = await createAuthorization(wallet, state.settings, challenge);
+    const { paymentId, xPaymentHeader } = await createAuthorization(wallet, state.settings, challenge);
     console.info("x402-autopay:bg processPayment:signed", { paymentId });
     const record: PaymentRecord = {
       id: paymentId,
@@ -690,7 +687,6 @@ async function processPayment(
       retryHeaders: {
         "X-PAYMENT": xPaymentHeader,
         "X-PAYMENT-ID": paymentId,
-        ...(extraHeaders ?? {}),
       },
     } satisfies ChallengeResolution;
   } catch (error) {
